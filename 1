@@ -1,0 +1,280 @@
+import pyodbc
+import pandas as pd
+import matplotlib.pyplot as plt
+import seaborn as sns
+import datetime
+import calendar
+import io
+import smtplib
+from email.mime.multipart import MIMEMultipart
+from email.mime.text import MIMEText
+from email.mime.image import MIMEImage
+
+# ==========================================
+# KONFIGURACJA
+# ==========================================
+DB_SERVER = r'NAZWA_SERWERA\INSTANCJA'
+DB_NAME = 'NazwaBazyDanych'
+
+EMAIL_SERVER = 'exchange.firma.pl'
+EMAIL_FROM = 'raporty@firma.pl'
+EMAIL_TO = ['osoba1@firma.pl', 'osoba2@firma.pl']
+EMAIL_CC = ['dw1@firma.pl', 'dw2@firma.pl']
+EMAIL_BCC = ['udw1@firma.pl', 'udw2@firma.pl']  # Ukryte do wiadomości
+
+VENDORS = ['JEDEN', 'DWA']  # Podmień na rzeczywiste nazwy (cc/vendorname) z bazy
+
+
+class ReportGenerator:
+    def __init__(self):
+        self.today = datetime.date.today()
+        # Wyliczanie dat na podstawie tego, że skrypt uruchamia się w poniedziałek
+        self.last_monday = self.today - datetime.timedelta(days=self.today.weekday() + 7)
+        self.last_friday = self.last_monday + datetime.timedelta(days=4)
+
+        # Poczatek i koniec analizowanego miesiaca (z perspektywy zeszłego tygodnia)
+        self.month_start = self.last_monday.replace(day=1)
+        last_day = calendar.monthrange(self.last_monday.year, self.last_monday.month)[1]
+        self.month_end = self.last_monday.replace(day=last_day)
+
+        # Sprawdzenie, czy miniony tydzień kończy miesiąc
+        self.is_month_summary = (last_day - self.last_friday.day) < 7
+
+        sns.set_theme(style="whitegrid")
+
+    def get_data_from_sql(self):
+        """Pobiera surowe dane z bazy za pomocą tSQL, używając aliasów dla spójności w Pandas."""
+        conn_str = f'DRIVER={{ODBC Driver 17 for SQL Server}};SERVER={DB_SERVER};DATABASE={DB_NAME};Trusted_Connection=yes;'
+
+        try:
+            conn = pyodbc.connect(conn_str)
+
+            # Tabela 1: Wyliczone przez operacyjnych
+            query_capa_calc = f"""
+                SELECT data AS Data, hh AS Interwal, prognoza AS CapaWyliczone
+                FROM bd.[domena\\schemat].capa_v_operacyjni
+                WHERE data >= '{self.month_start}' AND data <= '{self.month_end}'
+            """
+
+            # Tabela 2: Deklarowane przez vendorów
+            query_capa_decl = f"""
+                SELECT data AS Data, godzina AS Interwal, cc AS Vendor, capa AS CapaDeklarowane
+                FROM bd.[domena\\schemat].capa_v
+                WHERE data >= '{self.month_start}' AND data <= '{self.month_end}'
+            """
+
+            # Tabela 3: Rzeczywistość - wysłane
+            query_actuals = f"""
+                SELECT data AS Data, godzina AS Interwal, vendorname AS Vendor, volumen AS Rzeczywiste
+                FROM bd.[domena\\schemat].wyslane_vendor_pl
+                WHERE data >= '{self.month_start}' AND data <= '{self.month_end}'
+            """
+
+            df_calc = pd.read_sql(query_capa_calc, conn)
+            df_decl = pd.read_sql(query_capa_decl, conn)
+            df_actuals = pd.read_sql(query_actuals, conn)
+
+            conn.close()
+            return df_calc, df_decl, df_actuals
+
+        except Exception as e:
+            print(f"Błąd połączenia z bazą: {e}")
+            return pd.DataFrame(), pd.DataFrame(), pd.DataFrame()
+
+    def process_data(self, df_calc, df_decl, df_actuals):
+        """Przetwarza dane, łata luki w datach i godzinach (Pandas)."""
+        bdate_range = pd.bdate_range(start=self.month_start, end=self.month_end).date
+        hours = list(range(8, 23))  # 8 do 22
+
+        idx_total = pd.MultiIndex.from_product([bdate_range, hours], names=['Data', 'Interwal'])
+        df_master_total = pd.DataFrame(index=idx_total).reset_index()
+        df_master_total['Data'] = pd.to_datetime(df_master_total['Data']).dt.date
+
+        idx_vendors = pd.MultiIndex.from_product([bdate_range, hours, VENDORS], names=['Data', 'Interwal', 'Vendor'])
+        df_master_vendors = pd.DataFrame(index=idx_vendors).reset_index()
+        df_master_vendors['Data'] = pd.to_datetime(df_master_vendors['Data']).dt.date
+
+        if not df_calc.empty:
+            df_calc['Data'] = pd.to_datetime(df_calc['Data']).dt.date
+            df_master_total = pd.merge(df_master_total, df_calc, on=['Data', 'Interwal'], how='left')
+        else:
+            df_master_total['CapaWyliczone'] = 0
+
+        if not df_decl.empty:
+            df_decl['Data'] = pd.to_datetime(df_decl['Data']).dt.date
+            df_master_vendors = pd.merge(df_master_vendors, df_decl, on=['Data', 'Interwal', 'Vendor'], how='left')
+        else:
+            df_master_vendors['CapaDeklarowane'] = 0
+
+        if not df_actuals.empty:
+            df_actuals['Data'] = pd.to_datetime(df_actuals['Data']).dt.date
+            df_master_vendors = pd.merge(df_master_vendors, df_actuals, on=['Data', 'Interwal', 'Vendor'], how='left')
+        else:
+            df_master_vendors['Rzeczywiste'] = 0
+
+        df_master_total.fillna(0, inplace=True)
+        df_master_vendors.fillna(0, inplace=True)
+
+        return df_master_total, df_master_vendors
+
+    def generate_chart(self, df_total, df_vendors):
+        """Generuje wykres do pamięci (BytesIO) dla osadzenia w emailu."""
+        df_vendors_total = df_vendors.groupby(['Data', 'Interwal'])[
+            ['CapaDeklarowane', 'Rzeczywiste']].sum().reset_index()
+        df_plot = pd.merge(df_total, df_vendors_total, on=['Data', 'Interwal'], how='left')
+
+        df_plot = df_plot[df_plot['Data'] <= self.last_friday]
+        df_plot['X_Label'] = df_plot.apply(lambda row: f"{row['Interwal']:02d}:00\n{row['Data'].strftime('%d %b')}",
+                                           axis=1)
+
+        fig, ax = plt.subplots(figsize=(14, 6))
+
+        ax.bar(df_plot['X_Label'], df_plot['Rzeczywiste'], color='#1f77b4', label='Rzeczywiste wysłane', width=0.4)
+        ax.plot(df_plot['X_Label'], df_plot['CapaWyliczone'], color='#2ca02c', label='Capa wyliczone', linewidth=2,
+                marker='')
+        ax.plot(df_plot['X_Label'], df_plot['CapaDeklarowane'], color='#ff7f0e', label='Capa deklarowane', linewidth=2,
+                marker='')
+
+        plt.xticks(rotation=0, fontsize=8)
+        for index, label in enumerate(ax.xaxis.get_ticklabels()):
+            if index % 5 != 0:
+                label.set_visible(False)
+
+        ax.set_title(f"Wolumen interakcji - {self.month_start.strftime('%B %Y')}", fontsize=14, pad=15)
+        ax.legend()
+        plt.tight_layout()
+
+        img_buffer = io.BytesIO()
+        plt.savefig(img_buffer, format='png', dpi=100)
+        img_buffer.seek(0)
+        plt.close()
+
+        return img_buffer
+
+    def generate_html_tables(self, df_total, df_vendors):
+        """Buduje kod HTML dla podsumowania minionego tygodnia i reszty/całego miesiąca."""
+
+        def build_table_html(title, df_t, df_v, calculate_percentage=False):
+            sum_calc = df_t['CapaWyliczone'].sum()
+            sum_v = df_v.groupby('Vendor')[['CapaDeklarowane', 'Rzeczywiste']].sum().reset_index()
+
+            total_decl = sum_v['CapaDeklarowane'].sum()
+            total_real = sum_v['Rzeczywiste'].sum()
+
+            html = f'<h3 style="color: #d62728; font-family: sans-serif;">{title}</h3>'
+            html += '<table style="border-collapse: collapse; width: 600px; font-family: sans-serif; text-align: right;">'
+            html += '<tr style="border-bottom: 2px solid white; background-color: #222; color: white;">'
+            html += '<th style="padding: 8px;"></th><th style="padding: 8px;">capa wyliczone</th>'
+            html += '<th style="padding: 8px;">capa deklarowane</th><th style="padding: 8px;">rzeczywiste wysłane</th></tr>'
+
+            for vendor in VENDORS:
+                v_data = sum_v[sum_v['Vendor'] == vendor]
+                capa_d = int(v_data['CapaDeklarowane'].iloc[0]) if not v_data.empty else 0
+                rzecz = int(v_data['Rzeczywiste'].iloc[0]) if not v_data.empty else 0
+
+                html += f'<tr style="border-bottom: 1px solid #444; background-color: #333; color: white;">'
+                html += f'<td style="padding: 8px; font-weight: bold; text-align: left;">{vendor}</td>'
+                html += f'<td style="padding: 8px; background-color: #444;"></td>'
+                html += f'<td style="padding: 8px;">{capa_d:,}</td>'
+                html += f'<td style="padding: 8px;">{rzecz:,}</td></tr>'
+
+            html += f'<tr style="border-bottom: 1px solid white; background-color: #222; color: white; font-weight: bold;">'
+            html += f'<td style="padding: 8px; text-align: left;">TOTAL</td>'
+            html += f'<td style="padding: 8px;">{int(sum_calc):,}</td>'
+            html += f'<td style="padding: 8px;">{int(total_decl):,}</td>'
+            html += f'<td style="padding: 8px;">{int(total_real):,}</td></tr>'
+
+            html += '</table>'
+
+            if calculate_percentage and sum_calc > 0:
+                perc = (total_real / sum_calc) * 100
+                html += '<table style="border-collapse: collapse; width: 600px; font-family: sans-serif; text-align: right; margin-top: 5px;">'
+                html += '<tr style="background-color: #222; color: white; font-weight: bold;">'
+                html += f'<td style="padding: 8px; width: 70%;">% realizacji zaprognozowanego wolumenu</td>'
+                html += f'<td style="padding: 8px; width: 30%;">{perc:.2f}%</td></tr>'
+                html += '</table>'
+
+            return html.replace(',', ' ')
+
+        mask_week_t = (df_total['Data'] >= self.last_monday) & (df_total['Data'] <= self.last_friday)
+        mask_week_v = (df_vendors['Data'] >= self.last_monday) & (df_vendors['Data'] <= self.last_friday)
+
+        html_output = build_table_html(
+            f"Podsumowanie tygodnia {self.last_monday.strftime('%d.%m')} - {self.last_friday.strftime('%d.%m')}",
+            df_total[mask_week_t], df_vendors[mask_week_v], calculate_percentage=True)
+
+        if self.is_month_summary:
+            title_2 = "Podsumowanie miesiąca"
+            mask_t = (df_total['Data'] >= self.month_start) & (df_total['Data'] <= self.last_friday)
+            mask_v = (df_vendors['Data'] >= self.month_start) & (df_vendors['Data'] <= self.last_friday)
+        else:
+            title_2 = "Do końca miesiąca"
+            mask_t = (df_total['Data'] > self.last_friday) & (df_total['Data'] <= self.month_end)
+            mask_v = (df_vendors['Data'] > self.last_friday) & (df_vendors['Data'] <= self.month_end)
+
+        html_output += "<br>" + build_table_html(title_2, df_total[mask_t], df_vendors[mask_v],
+                                                 calculate_percentage=self.is_month_summary)
+
+        return html_output
+
+    def send_email(self, chart_buffer, html_tables):
+        """Tworzy i wysyła wiadomość email przez SMTP Exchange."""
+        msg = MIMEMultipart('related')
+
+        typ_raportu = "miesiąca" if self.is_month_summary else "tygodnia"
+        msg['Subject'] = f"Podsumowanie wolumenu - raport {typ_raportu}"
+        msg['From'] = EMAIL_FROM
+        msg['To'] = ", ".join(EMAIL_TO)
+        msg['Cc'] = ", ".join(EMAIL_CC)
+        # Bcc nie jest widoczne w standardowych nagłówkach dla odbiorców (zgodnie z protokołem MIME),
+        # ale dobrą praktyką jest upewnienie się, że obiekt maila go posiada w pamięci
+        msg['Bcc'] = ", ".join(EMAIL_BCC)
+
+        html_body = f"""
+        <html>
+        <body style="background-color: #1e1e1e; color: white; padding: 20px;">
+            <p style="font-family: sans-serif; font-size: 14px;">Cześć,<br><br>Przesyłam podsumowanie wolumenu:</p>
+            <br>
+            <img src="cid:wykres_img">
+            <br><br>
+            {html_tables}
+            <br>
+            <p style="font-family: sans-serif; font-size: 14px;">Pozdrawiam serdecznie,</p>
+        </body>
+        </html>
+        """
+
+        msg_alternative = MIMEMultipart('alternative')
+        msg.attach(msg_alternative)
+        msg_alternative.attach(MIMEText(html_body, 'html'))
+
+        img = MIMEImage(chart_buffer.read())
+        img.add_header('Content-ID', '<wykres_img>')
+        img.add_header('Content-Disposition', 'inline', filename='wykres.png')
+        msg.attach(img)
+
+        try:
+            # Lista WSZYSTKICH adresów, do których serwer SMTP fizycznie wyśle pakiety
+            wszyscy_odbiorcy = EMAIL_TO + EMAIL_CC + EMAIL_BCC
+
+            with smtplib.SMTP(EMAIL_SERVER) as server:
+                server.sendmail(EMAIL_FROM, wszyscy_odbiorcy, msg.as_string())
+            print("E-mail został pomyślnie wysłany!")
+        except Exception as e:
+            print(f"Błąd podczas wysyłki e-mail: {e}")
+
+    def run(self):
+        print(f"Uruchamiam generowanie raportu. Typ: {'Miesięczny' if self.is_month_summary else 'Tygodniowy'}")
+        df_calc, df_decl, df_actuals = self.get_data_from_sql()
+
+        df_master_total, df_master_vendors = self.process_data(df_calc, df_decl, df_actuals)
+
+        chart_buffer = self.generate_chart(df_master_total, df_master_vendors)
+        html_tables = self.generate_html_tables(df_master_total, df_master_vendors)
+
+        self.send_email(chart_buffer, html_tables)
+
+
+if __name__ == "__main__":
+    raport = ReportGenerator()
+    raport.run()
